@@ -1,0 +1,2387 @@
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
+from rest_framework.response import Response
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import JSONParser, FormParser, MultiPartParser
+import logging
+from rest_framework import status
+import re
+import jwt
+from django.conf import settings
+from datetime import datetime, timedelta
+import bcrypt
+import json
+
+
+import os
+from uuid import uuid4
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+
+
+MEDIA_URL = 'https://gsm.garudalytics.com:8002/media/'
+
+
+
+DB_NAME = "gsm_new"
+DB_USER = "postgres"
+DB_PASSWORD = "postgres"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+
+
+logger = logging.getLogger(__name__)
+
+
+def get_db_connection():
+    """Returns a PostgreSQL connection using psycopg2."""
+    try:
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection error: {str(e)}")
+        return None
+
+def decode_jwt_token(request):
+    """
+    Extract and decode JWT token from Authorization header.
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    print("auth_header", auth_header)
+    token = auth_header.split(" ")[1]
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        return payload  # contains user_id, email, etc.
+    except jwt.ExpiredSignatureError:
+        return "expired"
+    except jwt.InvalidTokenError:
+        return None
+
+
+def is_valid_email(email):
+    return re.match(r"[^@]+@[^@]+\.[^@]+", email)
+
+
+def save_uploaded_file_for_professional(file_obj):
+    base_folder = "professional_files"
+    folder_path = os.path.join(settings.MEDIA_ROOT, base_folder)
+
+    # Create professional_files folder only if not exists
+    os.makedirs(folder_path, exist_ok=True)
+
+    # Generate a unique filename
+    ext = os.path.splitext(file_obj.name)[1]
+    unique_filename = f"{uuid4()}{ext}"
+
+    # Path inside professional_files
+    relative_path = os.path.join(base_folder, unique_filename)
+
+    # Save file
+    saved_path = default_storage.save(relative_path, ContentFile(file_obj.read()))
+    return saved_path
+
+
+@api_view(['POST'])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
+def add_user(request):
+    try:
+        account_type = request.data.get('account_type')
+        first_name = request.data.get('first_name')
+        last_name = request.data.get('last_name')
+        password = request.data.get('password')  # already hashed from frontend
+        email = request.data.get('email')
+        phone = request.data.get('phone')
+ 
+        organization_id = request.data.get('organization_id')
+        role = "administrator"
+ 
+        # Professional-specific fields
+        aadhaar_number = request.data.get('aadhaar_number')
+        pan_number = request.data.get('pan_number')
+        gst_number = request.data.get('gst_number')
+ 
+        # Files
+        aadhaar_card = request.FILES.get('aadhaar_card')
+        pan_card = request.FILES.get('pan_card')
+        gst_certificate = request.FILES.get('gst_certificate')
+ 
+        if account_type not in ["professional", "organization"]:
+            return Response({"error": "Invalid account type"}, status=400)
+ 
+        if account_type == "professional":
+            required_fields = [first_name, last_name, email, phone, password, aadhaar_number, pan_number]
+            if not all(required_fields):
+                return Response({"error": "Missing required fields for professional account"}, status=400)
+ 
+        if account_type == "organization":
+            if not all([first_name, last_name, email, phone, password, organization_id]):
+                return Response({"error": "Missing required fields for organization account"}, status=400)
+ 
+        if not is_valid_email(email):
+            return Response({"error": "Invalid email format"}, status=400)
+ 
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+ 
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users WHERE email = %s", (email,))
+            if cur.fetchone():
+                conn.close()
+                return Response({"error": "Email already registered"}, status=409)
+ 
+            # Insert user
+            cur.execute("""
+                INSERT INTO users
+                (first_name, last_name, password, email, phone, account_type, organization_id, role)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING user_id
+            """, (
+                first_name,
+                last_name,
+                password,
+                email,
+                phone,
+                account_type,
+                organization_id if account_type == "organization" else None,
+                role if account_type == "professional" else None
+            ))
+ 
+            new_user_id = cur.fetchone()[0]
+ 
+            # Handle professional insert
+            if account_type == "professional":
+                # Save uploaded files
+                aadhaar_path = save_uploaded_file_for_professional(aadhaar_card) if aadhaar_card else None
+                pan_path = save_uploaded_file_for_professional(pan_card) if pan_card else None
+                gst_path = save_uploaded_file_for_professional(gst_certificate) if gst_certificate else None
+
+                cur.execute("""
+                    INSERT INTO professionals(
+                        user_id, aadhaar_number, pan_number, gst_number,
+                        aadhaar_card, pan_card, gst_certificate)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    new_user_id, aadhaar_number, pan_number, gst_number,
+                    aadhaar_path, pan_path, gst_path
+                ))
+ 
+        conn.commit()
+        conn.close()
+ 
+        return Response({
+            "message": "User registered successfully",
+            "user": {
+                "user_id": new_user_id,
+                "account_type": account_type
+            }
+        }, status=201)
+ 
+    except Exception as e:
+        logger.error(f"Error adding user: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['POST'])
+@parser_classes([JSONParser])
+def login_user(request):
+    try:
+        email = request.data.get("email")
+        phone = request.data.get("phone")
+        password = request.data.get("password")  # already hashed from frontend
+
+        # 1. Validate inputs
+        if not password or (not email and not phone):
+            return Response({"error": "Provide either email or phone along with password"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # 2. Build query dynamically
+            if email:
+                cur.execute("""
+                    SELECT user_id, first_name, last_name, email, phone, password,
+                           account_type, organization_name, gst, industry_type, role
+                    FROM users
+                    WHERE email = %s
+                """, (email,))
+            else:
+                cur.execute("""
+                    SELECT user_id, first_name, last_name, email, phone, password,
+                           account_type, organization_name, gst, industry_type, role
+                    FROM users
+                    WHERE phone = %s
+                """, (phone,))
+
+            row = cur.fetchone()
+
+        # 3. Verify user exists
+        if not row:
+            return Response({"error": "Invalid credentials"}, status=401)
+        
+        with conn.cursor() as cur:
+            if email:
+                cur.execute("""
+                    SELECT user_id, first_name, last_name, email, phone, password,
+                           account_type, organization_name, gst, industry_type,role
+                    FROM users
+                    WHERE email = %s and status = 'active'
+                """, (email,))
+            else:
+                cur.execute("""
+                    SELECT user_id, first_name, last_name, email, phone, password,
+                           account_type, organization_name, gst, industry_type,role
+                    FROM users
+                    WHERE phone = %s and status = 'active'
+                """, (phone,))
+
+            checkUser = cur.fetchone()
+
+        # Verify user status
+        if not checkUser:
+            return Response({"message": "User is Inactive, Please contact Adminstrator"}, status=301)
+
+        # Map tuple to dict manually
+        columns = ["user_id", "first_name", "last_name", "email", "phone", 
+                   "password", "account_type", "organization_name", "gst", "industry_type","role"]
+        user = dict(zip(columns, row))
+
+        # if user["password"] != password:
+        #     return Response({"error": "Invalid credentials"}, status=401)
+        print("password.encode(utf-8)", password.encode("utf-8"))
+        print("password. user db", user["password"].encode("utf-8"))
+        print("checking ", bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")))
+        # Compare password using bcrypt
+        if not bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
+            return Response({"error": "Invalid credentials"}, status=401)
+
+
+        # 4. Generate JWT access token (no refresh token)
+        payload = {
+            "user_id": user["user_id"],
+            "exp": datetime.utcnow() + timedelta(hours=10),  # token valid for 10 hours
+            "iat": datetime.utcnow()
+        }
+        token = jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+
+        # 5. Success response
+        return Response({
+            "message": "Login successful",
+            "user": {
+                "user_id": user["user_id"],
+                "first_name": user["first_name"],
+                "last_name": user["last_name"],
+                "role":user["role"],
+
+            },
+            "token": str(token)
+        }, status=200)
+
+    except Exception as e:
+        logger.error(f"Error during login: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+
+
+@api_view(['GET'])
+def get_all_users(request):
+    conn = None
+    try:
+        # 1. Validate JWT token
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        user_id = payload.get("user_id")
+        if not user_id:
+            return Response({"error": "Unauthorized"}, status=401)
+
+        # 2. DB connection
+        conn = get_db_connection()
+
+        # STEP 1: Get the current user's role and account type
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT role, account_type 
+                FROM public.users 
+                WHERE user_id = %s
+            """, [user_id])
+            user_info = cursor.fetchone()
+
+        if not user_info:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        role, account_type = user_info
+
+        # STEP 2: Build SQL based on role
+        if role == 'superadmin':
+            sql = """
+                SELECT * FROM public.users
+                WHERE account_type = 'professional'
+                   OR (account_type = 'organization' AND role = 'administrator')
+            """
+        elif account_type == 'professional':
+            sql = """
+                SELECT * FROM public.users
+                WHERE account_type = 'professional'
+                  AND role IN ('editor', 'publisher', 'viewer')
+            """
+        elif account_type == 'organization':
+            sql = """
+                SELECT * FROM public.users
+                WHERE account_type = 'organization'
+                  AND role = 'administrator'
+            """
+        else:
+            return Response({"users": []}, status=200)
+
+        # STEP 3: Execute final query and fetch results
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+            columns = [col[0] for col in cursor.description]
+            users = [
+                dict(zip(columns, row))
+                for row in cursor.fetchall()
+            ]
+
+        return Response({"users": users}, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        logger.error(f"Error fetching users: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@api_view(['POST'])
+def get_user_details(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+
+    try:
+        # 1. Decode JWT token
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return JsonResponse({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return JsonResponse({"error": "Token expired"}, status=401)
+
+        # 2. Parse POST body
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        user_id = data.get("user_id")
+        if not user_id:
+            return JsonResponse({"status": 400, "message": "user_id not found"}, status=400)
+
+        # 3. Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"error": "Database connection failed"}, status=500)
+
+        cur = conn.cursor()
+
+        # 4. Get user data
+        cur.execute("""
+            SELECT user_id, first_name, last_name, email, user_type, account_type, role, status, organization_id
+            FROM public.users 
+            WHERE user_id = %s;
+        """, (user_id,))
+        row = cur.fetchone()
+
+        if not row:
+            return JsonResponse({"status": 404, "message": "User not found"}, status=404)
+
+        colnames = [desc[0] for desc in cur.description]
+        user_data = dict(zip(colnames, row))
+
+        account_type = user_data.get("account_type")
+
+        # 5. Fetch related data based on account_type
+        if account_type == "organization" and user_data.get("organization_id"):
+            cur.execute("""
+                SELECT organization_id, organization_name, address, admin_email
+                FROM public.organizations
+                WHERE organization_id = %s;
+            """, (user_data["organization_id"],))
+            org_row = cur.fetchone()
+            if org_row:
+                org_colnames = [desc[0] for desc in cur.description]
+                organization_data = dict(zip(org_colnames, org_row))
+                user_data["organization_data"] = organization_data
+
+        elif account_type == "professional":
+            cur.execute("""
+                SELECT professional_id, user_id, aadhaar_number, pan_number
+                FROM public.professionals
+                WHERE user_id = %s;
+            """, (user_id,))
+            prof_row = cur.fetchone()
+            if prof_row:
+                prof_colnames = [desc[0] for desc in cur.description]
+                professional_data = dict(zip(prof_colnames, prof_row))
+                user_data["professional_data"] = professional_data
+
+        # 6. Return combined result
+        return JsonResponse({
+            "status": 200,
+            "user_details": user_data
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching user details: {str(e)}")
+        return JsonResponse({"error": "Server error: " + str(e)}, status=500)
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+@api_view(['POST'])
+@parser_classes([JSONParser])
+def add_group(request):
+
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        group_name = request.data.get('name')
+        description = request.data.get('description')
+        parent_group = request.data.get('parentGroup')
+
+        # 1. Validation
+        if not group_name:
+            return Response({"error": "Group name is required"}, status=400)
+
+        # 2. Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # Check if group name already exists
+            cur.execute("SELECT group_id FROM groups WHERE group_name = %s", (group_name,))
+            if cur.fetchone():
+                conn.close()
+                return Response({"error": "Group name already exists"}, status=409)
+
+            # Insert new group
+            # cur.execute("""
+            #     INSERT INTO groups (group_name, description, parent_group)
+            #     VALUES (%s, %s, %s)
+            #     RETURNING group_id
+            # """, (group_name, description, parent_group))
+
+            # new_group_id = cur.fetchone()[0]
+
+            cur.execute("""
+                    INSERT INTO groups (group_name, description, parent_group)
+                    VALUES (%s, %s, %s)
+                    RETURNING group_id, created_at
+                """, (group_name, description, parent_group))
+
+            new_group_id, created_at = cur.fetchone()
+
+        conn.commit()
+        conn.close()
+
+        # 3. Response
+        return Response({
+            "message": "Group created successfully",
+            "group": {
+                "group_id": new_group_id,
+                "group_name": group_name,
+                "description": description,
+                "parent_group": parent_group,
+                "created_at": str(created_at)
+            }
+        }, status=201)
+
+    except Exception as e:
+        logger.error(f"Error creating group: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+@api_view(['POST'])
+@parser_classes([JSONParser])
+def update_group(request):
+    try:
+        # 1. Token validation
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        group_id = request.data.get('group_id')
+        group_name = request.data.get('name')
+        description = request.data.get('description')
+        parent_group = request.data.get('parent')
+
+        if not group_name:
+            return Response({"error": "Group name is required"}, status=400)
+
+        # 2. Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # Check if group exists
+            cur.execute("SELECT group_id FROM groups WHERE group_id = %s", (group_id,))
+            if not cur.fetchone():
+                conn.close()
+                return Response({"error": "Group not found"}, status=404)
+
+            # Check for duplicate group name (excluding current group)
+            cur.execute("SELECT group_id FROM groups WHERE group_name = %s AND group_id != %s", (group_name, group_id))
+            if cur.fetchone():
+                conn.close()
+                return Response({"error": "Group name already exists"}, status=409)
+
+            # Update group
+            cur.execute("""
+                UPDATE groups 
+                SET group_name = %s, description = %s, parent_group = %s
+                WHERE group_id = %s
+                RETURNING group_id, group_name, description, parent_group, created_at
+            """, (group_name, description, parent_group, group_id))
+
+            updated_group = cur.fetchone()
+
+        conn.commit()
+        conn.close()
+
+        return Response({
+            "message": "Group updated successfully",
+            "group": {
+                "group_id": updated_group[0],
+                "group_name": updated_group[1]
+            }
+        }, status=200)
+
+    except Exception as e:
+        logger.error(f"Error updating group: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['POST'])
+def delete_group(request):
+    try:
+        # 1. Token validation
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        group_id = request.data.get('group_id')
+
+        # 2. Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # Check if group exists
+            cur.execute("SELECT group_id FROM groups WHERE group_id = %s", (group_id,))
+            if not cur.fetchone():
+                conn.close()
+                return Response({"error": "Group not found"}, status=404)
+
+            # Delete group
+            cur.execute("DELETE FROM groups WHERE group_id = %s", (group_id,))
+
+        conn.commit()
+        conn.close()
+
+        return Response({"message": "Group deleted successfully"}, status=200)
+
+    except Exception as e:
+        logger.error(f"Error deleting group: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+@api_view(['GET'])
+def get_group_names(request):
+    try:
+
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT group_name FROM groups")
+            rows = cur.fetchall()
+
+        conn.close()
+
+        # Flatten rows (each row is a tuple like ('GIS Specialists',))
+        group_names = [row[0] for row in rows]
+
+        return Response(group_names, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching group names: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+@api_view(['GET'])
+def get_group_details(request):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        groups = []
+        with conn.cursor() as cur:
+            # Fetch group basic info
+            cur.execute("""
+                SELECT 
+                    g.group_id,
+                    g.group_name,
+                    g.description,
+                    g.parent_group,
+                    g.created_at,
+                    COUNT(u.user_id) AS total_members
+                FROM groups g
+                LEFT JOIN LATERAL (
+                    SELECT CAST(unnest(u.group_ids) AS int) AS gid, u.user_id
+                    FROM users u
+                    WHERE u.group_ids IS NOT NULL
+                ) j ON g.group_id = j.gid
+                LEFT JOIN users u ON u.user_id = j.user_id
+                GROUP BY g.group_id, g.group_name, g.description, g.parent_group, g.created_at
+                ORDER BY g.group_id;
+            """)
+            rows = cur.fetchall()
+            columns = ["group_id", "group_name", "description", "parent_group", "created_at", "total_members"]
+            groups = [dict(zip(columns, row)) for row in rows]
+
+            # For each group, get role counts
+            for group in groups:
+                cur.execute("""
+                    SELECT role, COUNT(*) 
+                    FROM users u
+                    WHERE u.group_ids IS NOT NULL 
+                      AND %s = ANY(u.group_ids)
+                    GROUP BY role;
+                """, (str(group["group_id"]),))  # Cast group_id to string since group_ids is text[]
+                role_rows = cur.fetchall()
+
+                # Map role counts into a dict
+                role_counts = {r.lower(): c for r, c in role_rows}
+                # Ensure all roles exist even if 0
+                for role in ["administrator", "publisher", "editor", "viewer"]:
+                    role_counts.setdefault(role, 0)
+                group["role_counts"] = role_counts
+
+        return Response({"groups": groups}, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching group details: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+
+
+
+@api_view(['POST'])
+@parser_classes([JSONParser])
+def update_user(request):
+    try:
+        user_id = request.data.get('user_id')
+        role = request.data.get('role')
+        status = request.data.get('status')
+        group_ids = request.data.get('groups')
+        apps = request.data.get('apps')
+
+        # Build dynamic update query only for provided fields
+        update_fields = []
+        values = []
+
+        if role is not None:
+            update_fields.append("role = %s")
+            values.append(role)
+
+        if status is not None:
+            update_fields.append("status = %s")
+            values.append(status)
+
+        if group_ids is not None:
+            update_fields.append("group_ids = %s")
+            values.append(json.dumps(group_ids) if isinstance(group_ids, list) else group_ids)
+
+        if apps is not None:
+            update_fields.append("apps = %s")
+            values.append(json.dumps(apps) if isinstance(apps, list) else apps)
+
+        if not update_fields:
+            return Response({"error": "No fields provided for update"}, status=400)
+
+        values.append(user_id)
+
+        # 2. Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # Check if user exists
+            cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+            if not cur.fetchone():
+                conn.close()
+                return Response({"error": "User not found"}, status=404)
+
+            # Update query with only provided fields
+            cur.execute(f"""
+                UPDATE users
+                SET {", ".join(update_fields)}
+                WHERE user_id = %s
+                RETURNING user_id
+            """, values)
+
+            updated_user = cur.fetchone()
+
+        conn.commit()
+        conn.close()
+
+        return Response({
+            "message": "User updated successfully",
+            "user": {
+                "user_id": updated_user[0]
+            }
+        }, status=200)
+
+    except Exception as e:
+        logger.error(f"Error updating user: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+@api_view(['POST'])
+@parser_classes([JSONParser])
+def delete_user(request):
+    try:
+        user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"error": "user_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cursor:
+            # Replace 'users' and 'user_id' with your actual table/column names
+            cursor.execute("DELETE FROM users WHERE user_id = %s", [user_id])
+            conn.commit()
+
+        return Response({"message": f"User with id {user_id} deleted successfully"}, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# APIs written by Chandu
+
+def percentage_change(current, previous):
+    if previous == 0:
+        if current == 0:
+            return "0%"
+        else:
+            return "100%"
+    change = ((current - previous) / previous) * 100
+    return f"{change:.2f}%"
+
+
+@api_view(['GET'])
+def dashboard_count(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT 
+                                (SELECT COALESCE(COUNT(*), 0) AS organization_count FROM public.organizations),
+                                (SELECT COALESCE(COUNT(*), 0) AS previous_month_organization_count FROM public.organizations 
+                                    WHERE organization_onboarded_date <=  CURRENT_DATE - INTERVAL '30 days'),
+                                (SELECT COALESCE(COUNT(1), 0) as active_users FROM public.users WHERE status = 'active' AND role <> 'superadmin'),
+                                (SELECT COALESCE(COUNT(1), 0) as previous_month_active_users FROM public.users 
+                                    WHERE joined_date < (now() - INTERVAL '30 days')::date AND role <> 'superadmin'),
+                                (SELECT COALESCE(COUNT(1), 0) as access_requests_this_month FROM public.users 
+                                    WHERE (role <> 'superadmin' OR role is null) AND joined_date >= (now() - INTERVAL '30 days')::date),
+                                (SELECT COALESCE(COUNT(1), 0) as access_requests_previous_months FROM public.users 
+                                    WHERE (role <> 'superadmin' OR role is null) AND joined_date < (now() - INTERVAL '30 days')::date),
+                                (SELECT organization_name AS recent_onboarded_organization_name FROM public.organizations
+                                    ORDER BY organization_onboarded_at DESC LIMIT 1),
+								 (SELECT organization_onboarded_at AS recent_organization_onboarded_at FROM public.organizations
+                                    ORDER BY organization_onboarded_at DESC LIMIT 1),
+                                (SELECT organization_name AS recent_access_granted FROM public.users
+                                    WHERE status = 'active' AND user_approved_at IS NOT NULL AND role <> 'superadmin'
+                                    ORDER BY user_approved_at DESC LIMIT 1),
+								(SELECT user_approved_at AS recent_access_granted_at FROM public.users
+                                    WHERE status = 'active' AND user_approved_at IS NOT NULL AND role <> 'superadmin'
+                                    ORDER BY user_approved_at DESC LIMIT 1)
+                        """)
+            row = cur.fetchone()
+            colnames = [desc[0] for desc in cur.description]
+
+        data_count = dict(zip(colnames, row)) if row else {}
+        conn.close()
+
+        results = {
+            "organization_growth": percentage_change(
+                data_count["organization_count"], 
+                data_count["previous_month_organization_count"]
+            ),
+            "active_users_growth": percentage_change(
+                data_count["active_users"], 
+                data_count["previous_month_active_users"]
+            ),
+            "access_requests_growth": percentage_change(
+                data_count["access_requests_this_month"], 
+                data_count["access_requests_previous_months"]
+            )
+        }
+
+        final_data = {
+            "data_count": data_count,
+            "results": results
+        }
+
+        return Response(final_data, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data count: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['GET'])
+def organizations_count(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT 
+                            (SELECT COUNT(*) AS active_users_count FROM public.users WHERE status ='active' AND role <> 'superadmin'),
+                            (SELECT COUNT(*) AS organization_count FROM public.organizations),
+                            (SELECT COUNT(*) AS previous_month_organization_count FROM public.organizations 
+                                WHERE organization_onboarded_date <=  CURRENT_DATE - INTERVAL '30 days'),
+                            (SELECT count(1) FROM public.organizations WHERE plan_type = 'Enterprise')
+                        """)
+            row = cur.fetchone()
+            colnames = [desc[0] for desc in cur.description]
+
+        data_count = dict(zip(colnames, row)) if row else {}
+        conn.close()
+
+        results = data_count["organization_count"] - data_count["previous_month_organization_count"]
+
+        final_data = {
+            "data_count": data_count,
+            "increased_organizations_count": results
+        }
+
+        return Response(final_data, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data count: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+def save_uploaded_file(file_obj, sub_folder="organization_files"):
+    folder_path = os.path.join(settings.MEDIA_ROOT, sub_folder)
+    os.makedirs(folder_path, exist_ok=True)
+
+    ext = os.path.splitext(file_obj.name)[1]
+    unique_filename = f"{uuid4()}{ext}"
+
+    relative_path = os.path.join(sub_folder, unique_filename)
+    saved_path = default_storage.save(relative_path, ContentFile(file_obj.read()))
+    return saved_path
+
+
+def clean_and_trim_for_organization_uid(value: str) -> str:
+    if not value:
+        return "000"   # default when missing or None
+    # Keep only letters and numbers
+    alnum_only = re.sub(r'[^A-Za-z0-9]', '', str(value))
+    if not alnum_only:
+        return "000"   # if everything got stripped
+    return alnum_only[:3].upper().ljust(3, "0")  # pad if <3 chars
+
+@csrf_exempt
+def add_organization(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        text_fields = [
+            "organization_name", "organization_type", "gst_number", "pan_number",
+            "tan_number", "cin_number", "msme_number", "admin_email",
+            "contact_number", "administrators_count", "publishers_count",
+            "editors_count", "viewers_count", "apps", "plan_type",
+            "licence_renewal_status", "admin_designation", "admin_name"
+        ]
+
+        file_fields = [
+            "company_logo", "gst_certificate", "pan_card",
+            "tan_certificate", "msme_certificate", "cin_certificate"
+        ]
+
+        insert_data = {}
+
+        for field in text_fields:
+            value = request.POST.get(field)
+            if value in [None, ""]:
+                insert_data[field] = None
+            else:
+                if field == "apps":
+                    try:
+                        insert_data[field] = json.loads(value) if isinstance(value, str) else value
+                    except Exception:
+                        return JsonResponse(
+                            {"status": 400, "message": "Invalid format for apps, expected JSON array"},
+                            status=400
+                        )
+                elif field in ["administrators_count", "publishers_count", "editors_count", "viewers_count"]:
+                    insert_data[field] = int(value)
+                else:
+                    insert_data[field] = value
+
+        org_name = insert_data.get("organization_name")
+        if org_name:
+            cur.execute("SELECT organization_id FROM public.organizations WHERE organization_name = %s", [org_name])
+            existing = cur.fetchone()
+            if existing:
+                return JsonResponse({"status": 409, "message": f"Organization '{org_name}' already exists"},status=409)
+
+        for field in file_fields:
+            if field in request.FILES:
+                file_obj = request.FILES[field]
+                insert_data[field] = save_uploaded_file(file_obj)
+            else:
+                insert_data[field] = None
+
+        col_names = list(insert_data.keys())
+        col_values = [insert_data[col] for col in col_names]
+
+        col_names.append("organization_uid")
+        keys_for_uid = [
+            "organization_name",
+            "gst_number",
+            "pan_number",
+            "tan_number",
+            "cin_number",
+            "msme_number"
+        ]
+        uid_parts = [clean_and_trim_for_organization_uid(insert_data.get(k, "")) for k in keys_for_uid]
+        u_id_value = "".join(uid_parts)
+        col_values.append(u_id_value)
+
+        insert_query = sql.SQL("""
+            INSERT INTO public.organizations ({fields})
+            VALUES ({placeholders})
+            RETURNING organization_id
+        """).format(
+            fields=sql.SQL(", ").join(map(sql.Identifier, col_names)),
+            placeholders=sql.SQL(", ").join(sql.Placeholder() * len(col_values)),
+        )
+
+        cur.execute(insert_query, col_values)
+        org_id = cur.fetchone()[0]
+        conn.commit()
+
+        return JsonResponse({
+            "status": 200,
+            "message": "Organization inserted successfully",
+            "organization_id": org_id,
+        })
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+@csrf_exempt
+def update_organization_by_id(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        org_id = request.POST.get("organization_id")
+        if not org_id:
+            return JsonResponse({"status": 400, "message": "Missing organization_id"}, status=400)
+
+        text_fields = [
+            "organization_name", "organization_type", "gst_number", "pan_number",
+            "tan_number", "cin_number", "msme_number", "admin_email",
+            "contact_number", "administrators_count", "publishers_count",
+            "editors_count", "viewers_count", "apps", "plan_type",
+            "licence_renewal_status", "license_type"
+        ]
+
+        file_fields = [
+            "company_logo", "gst_certificate", "pan_card",
+            "tan_certificate", "msme_certificate", "cin_certificate"
+        ]
+
+        update_data = {}
+
+        for field in text_fields:
+            value = request.POST.get(field)
+            if value in [None, ""]:
+                continue 
+            if field == "apps":
+                try:
+                    update_data[field] = json.loads(value) if isinstance(value, str) else value
+                except Exception:
+                    return JsonResponse(
+                        {"status": 400, "message": "Invalid format for apps, expected JSON array"},
+                        status=400
+                    )
+            elif field in ["administrators_count", "publishers_count", "editors_count", "viewers_count"]:
+                update_data[field] = int(value)
+            else:
+                update_data[field] = value
+
+        for field in file_fields:
+            if field in request.FILES:
+                file_obj = request.FILES[field]
+                update_data[field] = save_uploaded_file(file_obj)
+
+        if not update_data:
+            return JsonResponse({"status": 400, "message": "No fields provided for update"}, status=400)
+
+        col_names = list(update_data.keys())
+        col_values = [update_data[col] for col in col_names]
+
+        set_clause = sql.SQL(", ").join([
+            sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()) for col in col_names
+        ])
+
+        update_query = sql.SQL("""
+            UPDATE public.organizations
+            SET {set_clause}
+            WHERE organization_id = %s
+            RETURNING organization_id
+        """).format(set_clause=set_clause)
+
+        cur.execute(update_query, col_values + [org_id])
+        result = cur.fetchone()
+
+        if not result:
+            return JsonResponse({"status": 404, "message": "Organization not found"}, status=404)
+
+        conn.commit()
+
+        return JsonResponse({
+            "status": 200,
+            "message": "Organization updated successfully",
+            "organization_id": result[0],
+        })
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+@csrf_exempt
+def update_organization_details_by_id(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+
+    try:
+        # Validate JWT
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return JsonResponse({"status": 401, "message": "Invalid token"}, status=401)
+        if payload == "expired":
+            return JsonResponse({"status": 401, "message": "Token expired"}, status=401)
+
+        # Parse JSON body
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({"status": 400, "message": "Invalid JSON"}, status=400)
+
+        org_id = data.get("organization_id")
+        if not org_id:
+            return JsonResponse({"status": 400, "message": "Missing organization_id"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        # Fields that can be updated
+        allowed_fields = [
+            "admin_email", "plan_type", "industry", "website", "address", "organization_status", "license_type",
+            "admin_designation", "admin_name"
+        ]
+
+        update_data = {}
+
+        for field in allowed_fields:
+            value = data.get(field)
+            if value in [None, ""]:
+                continue
+            else:
+                update_data[field] = value
+
+        if not update_data:
+            return JsonResponse({"status": 400, "message": "No fields provided for update"}, status=400)
+
+        # Construct SQL
+        col_names = list(update_data.keys())
+        col_values = [update_data[col] for col in col_names]
+
+        set_clause = sql.SQL(", ").join([
+            sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()) for col in col_names
+        ])
+
+        update_query = sql.SQL("""
+            UPDATE public.organizations
+            SET {set_clause}
+            WHERE organization_id = %s
+            RETURNING organization_id
+        """).format(set_clause=set_clause)
+
+        cur.execute(update_query, col_values + [org_id])
+        result = cur.fetchone()
+
+        if not result:
+            return JsonResponse({"status": 404, "message": "Organization not found"}, status=404)
+
+        conn.commit()
+
+        return JsonResponse({
+            "status": 200,
+            "message": "Organization updated successfully",
+            "organization_id": result[0],
+        })
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+@csrf_exempt
+def get_organizations_list(request):
+    if request.method != "GET":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        # payload = decode_jwt_token(request)
+        # if payload is None:
+        #     return Response({"error": "Invalid token"}, status=401)
+        # if payload == "expired":
+        #     return Response({"error": "Token expired"}, status=401)
+        
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute(""" SELECT organization_id, organization_name FROM public.organizations """)
+
+        rows = cur.fetchall()
+        if not rows:
+            return JsonResponse({"status": 404, "message": "No organizations found"}, status=404)
+
+        colnames = [desc[0] for desc in cur.description]
+
+        organizations = [dict(zip(colnames, row)) for row in rows]
+
+        return JsonResponse({
+            "status": 200,
+            "organizations": organizations
+        })
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+
+@csrf_exempt
+def get_organizations(request):
+    if request.method != "GET":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT organization_id, organization_name, organization_type, gst_number, pan_number,
+                   tan_number, cin_number, msme_number, admin_email, contact_number,
+                   administrators_count, publishers_count, editors_count, viewers_count,
+                   apps, plan_type, organization_onboarded_date, organization_onboarded_at,
+                   licence_renewal_status, status, status_changed_at, industry, website, address, organization_status,
+                   admin_designation, admin_name, license_type,
+                   company_logo, gst_certificate, pan_card, tan_certificate, msme_certificate, cin_certificate, organization_uid
+            FROM public.organizations
+        """)
+
+        rows = cur.fetchall()
+        if not rows:
+            return JsonResponse({"status": 404, "message": "No organizations found"}, status=404)
+
+        colnames = [desc[0] for desc in cur.description]
+
+        organizations = []
+        file_fields = [
+            "company_logo", "gst_certificate", "pan_card",
+            "tan_certificate", "msme_certificate", "cin_certificate"
+        ]
+
+        for row in rows:
+            org_data = dict(zip(colnames, row))
+
+            # convert file fields to URLs
+            for field in file_fields:
+                if org_data.get(field):
+                    org_data[field] = request.build_absolute_uri(
+                        settings.MEDIA_URL + org_data[field]
+                    )
+
+            organizations.append(org_data)
+
+        return JsonResponse({
+            "status": 200,
+            "organizations": organizations
+        })
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+
+@csrf_exempt
+def get_organization_by_id(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        org_id = data.get("organization_id")
+        if not org_id:
+            return JsonResponse({"status": 400, "message": "organization_id is required"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT organization_id, organization_name, organization_type, gst_number, pan_number,
+                   tan_number, cin_number, msme_number, admin_email, contact_number,
+                   administrators_count, publishers_count, editors_count, viewers_count,
+                   apps, plan_type, organization_onboarded_date, organization_onboarded_at,
+                   licence_renewal_status, status, status_changed_at, industry, website, address, organization_status,
+                   admin_designation, admin_name, license_type,
+                   company_logo, gst_certificate, pan_card, tan_certificate, msme_certificate, cin_certificate, organization_uid
+            FROM public.organizations
+            WHERE organization_id = %s
+        """, [org_id])
+
+        row = cur.fetchone()
+        if not row:
+            return JsonResponse({"status": 404, "message": "Organization not found"}, status=404)
+
+        colnames = [desc[0] for desc in cur.description]
+        org_data = dict(zip(colnames, row))
+
+        file_fields = [
+            "company_logo", "gst_certificate", "pan_card",
+            "tan_certificate", "msme_certificate", "cin_certificate"
+        ]
+
+        for field in file_fields:
+            if org_data.get(field):
+                org_data[field] = request.build_absolute_uri(
+                    settings.MEDIA_URL + org_data[field]
+                )
+
+        return JsonResponse({
+            "status": 200,
+            "organization": org_data
+        })
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+
+@csrf_exempt
+def get_organization_users(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        org_id = data.get("organization_id")
+        if not org_id:
+            return JsonResponse({"status": 400, "message": "organization_id is required"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT 1 FROM public.organizations WHERE organization_id = %s
+        """, [org_id])
+
+        row = cur.fetchone()
+        if not row:
+            return JsonResponse({"status": 404, "message": "Organization not found"}, status=404)
+
+        cur.execute("""
+            SELECT u.user_id, u.first_name, u.last_name, u.email, u.user_type, u.account_type, u.industry_type,
+                    org.organization_name, u.gst, u.role, u.status, u.apps, u.group_ids, u.joined_date,
+                    u.phone, u.user_approved_at, u.organization_id
+            FROM public.organizations org
+            INNER JOIN public.users u
+            ON org.organization_id = u.organization_id
+            WHERE org.organization_id = %s
+        """, [org_id])
+
+        rows = cur.fetchall()
+        if not rows:
+            return JsonResponse({"status": 200, "message": "Users Not Found", "data": []}, status=201)
+
+        colnames = [desc[0] for desc in cur.description]
+        org_data = [dict(zip(colnames, row)) for row in rows]
+
+        return JsonResponse({"status": 200, "data": org_data})
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+@csrf_exempt
+def suspend_organization(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+        
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        org_id = data.get("organization_id")
+        status = data.get("status")
+        if not org_id:
+            return JsonResponse({"status": 400, "message": "organization_id is required"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute("""
+            UPDATE public.organizations SET organization_status = %s, status_changed_at = now()
+            WHERE organization_id = %s
+        """, [status, org_id])
+
+        print("cur.rowcount", cur.rowcount)
+        if cur.rowcount == 0:
+            return JsonResponse({"status": 404, "message": "Organization not found"}, status=404)
+
+        conn.commit()
+        return JsonResponse({"status": 200, "message": "Organization status updated"})
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+
+@csrf_exempt
+def add_app(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return JsonResponse({"status": 401, "error": "Invalid token"})
+        if payload == "expired":
+            return JsonResponse({"status": 401, "error": "Token expired"})
+
+        try:
+            body = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON body"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        text_fields = [
+            "app_name", "app_description", "license_type", "app_status", "app_features"
+        ]
+
+        insert_data = {}
+        for field in text_fields:
+            value = body.get(field)
+            if value in [None, ""]:
+                insert_data[field] = None
+            else:
+                if field == "app_features":
+                    if not isinstance(value, list):
+                        return JsonResponse({
+                            "status": 400,
+                            "message": "Invalid format for app_features, expected JSON array"
+                        }, status=400)
+                    insert_data[field] = value
+                else:
+                    insert_data[field] = value
+
+        app_name = insert_data.get("app_name")
+        if app_name:
+            cur.execute("SELECT app_id FROM public.apps WHERE app_name = %s", [app_name])
+            existing = cur.fetchone()
+            if existing:
+                return JsonResponse({
+                    "status": 409,
+                    "message": f"App '{app_name}' already exists"
+                }, status=409)
+
+        col_names = list(insert_data.keys())
+        col_values = [insert_data[col] for col in col_names]
+
+        insert_query = sql.SQL("""
+            INSERT INTO public.apps ({fields})
+            VALUES ({placeholders})
+            RETURNING app_id
+        """).format(
+            fields=sql.SQL(", ").join(map(sql.Identifier, col_names)),
+            placeholders=sql.SQL(", ").join(sql.Placeholder() * len(col_values)),
+        )
+
+        cur.execute(insert_query, col_values)
+        new_app_id = cur.fetchone()[0]
+        conn.commit()
+
+        return JsonResponse({
+            "status": 200,
+            "message": "App added successfully",
+            "app_id": new_app_id
+        })
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+
+@csrf_exempt
+def get_apps(request):
+    if request.method != "GET":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return JsonResponse({"status": 401, "error": "Invalid token"})
+        if payload == "expired":
+            return JsonResponse({"status": 401, "error": "Token expired"})
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT app_id, app_name, app_description, license_type, app_status, app_features
+            FROM public.apps
+            ORDER BY app_id ASC
+        """)
+        rows = cur.fetchall()
+
+        apps = []
+        for row in rows:
+            apps.append({
+                "app_id": row[0],
+                "app_name": row[1],
+                "app_description": row[2],
+                "license_type": row[3],
+                "app_status": row[4],
+                "app_features": row[5] if row[5] else []
+            })
+
+        return JsonResponse({"status": 200, "apps": apps})
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+
+@csrf_exempt
+def get_app_by_app_id(request):
+    if request.method != "POST":
+        return JsonResponse({"status": 405, "message": "Method not allowed"}, status=405)
+
+    conn = None
+    cur = None
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return JsonResponse({"status": 401, "error": "Invalid token"})
+        if payload == "expired":
+            return JsonResponse({"status": 401, "error": "Token expired"})
+
+        try:
+            body = json.loads(request.body.decode("utf-8"))
+            app_id = body.get("app_id")
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON body"}, status=400)
+
+        if not app_id:
+            return JsonResponse({"status": 400, "message": "app_id is required"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return JsonResponse({"status": 500, "message": "Database connection failed"}, status=500)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT app_id, app_name, app_description, license_type, app_status, app_features
+            FROM public.apps
+            WHERE app_id = %s
+        """, [app_id])
+        row = cur.fetchone()
+
+        if not row:
+            return JsonResponse({"status": 404, "message": "App not found"}, status=404)
+
+        app_data = {
+            "app_id": row[0],
+            "app_name": row[1],
+            "app_description": row[2],
+            "license_type": row[3],
+            "app_status": row[4],
+            "app_features": row[5] if row[5] else []
+        }
+
+        return JsonResponse({"status": 200, "app": app_data})
+
+    except Exception as e:
+        return JsonResponse({"status": 500, "message": f"Error: {str(e)}"}, status=500)
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+
+"""Analytics Screen APIs Starts Here"""
+
+@api_view(['GET'])
+def analytics_count(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT 
+                                (SELECT COALESCE(COUNT(1), 0) as active_users FROM public.users WHERE status = 'active'),
+                                (SELECT COALESCE(COUNT(1), 0) as previous_month_active_users FROM public.users 
+                                    WHERE joined_date < (now() - INTERVAL '30 days')::date)
+                            FROM public.users
+                        """)
+            row = cur.fetchone()
+            colnames = [desc[0] for desc in cur.description]
+
+        data_count = dict(zip(colnames, row)) if row else {}
+        conn.close()
+
+        results = {
+            "active_users_growth": percentage_change(
+                data_count["active_users"], 
+                data_count["previous_month_active_users"]
+            )
+        }
+
+        final_data = {
+            "data_count": data_count,
+            "results": results
+        }
+
+        return Response(final_data, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data count: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+@api_view(['GET'])
+def analytics_organization_usage(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT o.organization_id, o.organization_name, o.plan_type, COUNT(u.user_id) AS active_users
+                                FROM public.organizations o
+                                INNER JOIN public.users u 
+                                    ON o.organization_id = u.organization_id 
+                                AND u.status = 'active'
+                                GROUP BY o.organization_id, o.organization_name, o.plan_type
+                                HAVING COUNT(u.user_id) > 0
+                                ORDER BY o.organization_name
+                        """)
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+
+        data = [dict(zip(colnames, row)) for row in rows] if rows else []
+        conn.close()
+
+        return Response(data, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+"""Compliance Screen APIs Starts Here"""
+
+@api_view(['GET'])
+def compliance_count(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT
+                                (SELECT COUNT(1) as pending_licence_renewal_count FROM public.organizations 
+                                    WHERE licence_renewal_status = 'pending'),
+                                (SELECT COUNT(1) as verified_licence_renewal_count FROM public.organizations 
+                                    WHERE licence_renewal_status = 'verified'),
+                                (SELECT COUNT(1) as organization_count FROM public.organizations),
+                                (SELECT COUNT(1) as upcoming_licence_renewal_count FROM public.organizations
+                                    WHERE upcoming_license_renewal_date BETWEEN current_date 
+                                        AND (current_date + INTERVAL '30 days')::date),
+                                (SELECT COUNT(1) as pending_licence_renewal_count_professional FROM public.professionals 
+                                    WHERE license_renewal_status = 'pending'),
+                                (SELECT COUNT(1) as verified_licence_renewal_count_professional FROM public.professionals 
+                                    WHERE license_renewal_status = 'verified'),
+                                (SELECT COUNT(1) as professional_count FROM public.professionals),
+                                (SELECT COUNT(1) as upcoming_licence_renewal_count_professional FROM public.professionals
+                                    WHERE upcoming_license_renewal_date BETWEEN current_date 
+                                        AND (current_date + INTERVAL '30 days')::date)
+                        """)
+            row = cur.fetchone()
+            colnames = [desc[0] for desc in cur.description]
+
+        data_count = dict(zip(colnames, row)) if row else {}
+        conn.close()
+
+        return Response(data_count, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data count: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+@api_view(['GET'])
+def organizations_compliance_status(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT organization_id, organization_name, gst_number, pan_number, tan_number, cin_number, 
+                                msme_number, admin_email, contact_number, gst_certificate, pan_card, tan_certificate, 
+                                msme_certificate, cin_certificate, licence_renewal_status, last_license_renewed_at, upcoming_license_renewal_date,
+                                organization_status, license_type, organization_onboarded_date 
+                            FROM public.organizations
+                        """)
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+
+        conn.close()
+
+        organizations = []
+        file_fields = [
+            "gst_certificate", "pan_card",
+            "tan_certificate", "msme_certificate", "cin_certificate"
+        ]
+
+        for row in rows:
+            org_data = dict(zip(colnames, row))
+
+            # convert file fields to URLs
+            for field in file_fields:
+                if org_data.get(field):
+                    org_data[field] = request.build_absolute_uri(
+                        settings.MEDIA_URL + org_data[field]
+                    )
+
+            organizations.append(org_data)
+
+        return Response(organizations, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['GET'])
+def professionals_compliance_status(request):
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT p.professional_id, p.user_id, p.aadhaar_number, p.pan_number, p.apps, p.plan_type, p.website, p.address,
+                                p.license_type, p.license_renewal_status, p.last_license_renewed_at, p.upcoming_license_renewal_date,
+                                p.aadhaar_card, p.pan_card, p.gst_number, p.gst_certificate, u.first_name, u.last_name, u.status, u.email
+                            FROM public.professionals p inner join users u
+                                ON p.user_id = u.user_id
+                        """)
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+
+        conn.close()
+
+        professionals = []
+        file_fields = [ "aadhaar_card", "pan_card", "gst_certificate" ]
+
+        for row in rows:
+            org_data = dict(zip(colnames, row))
+
+            # convert file fields to URLs
+            for field in file_fields:
+                if org_data.get(field):
+                    org_data[field] = request.build_absolute_uri(
+                        settings.MEDIA_URL + org_data[field]
+                    )
+
+            professionals.append(org_data)
+
+        return Response(professionals, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching data: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['GET'])
+def admin_dashboard_data(request):
+    
+    try:
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        user_id = payload.get('user_id')
+        if not user_id:
+            return Response({"error": "User ID not found in token"}, status=400)
+
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    o.organization_id,
+                    o.organization_name,
+                    o.license_type,
+                    o.upcoming_license_renewal_date,
+                    o.organization_status,
+                    o.admin_email,
+                    u.active_users,
+                    g.total_groups
+                FROM organizations o
+                JOIN users usr ON usr.organization_id = o.organization_id
+                CROSS JOIN (
+                    SELECT COUNT(*) AS active_users FROM users WHERE status = 'active'
+                ) u
+                CROSS JOIN (
+                    SELECT COUNT(*) AS total_groups FROM groups
+                ) g
+                WHERE usr.user_id = %s;
+            """, (user_id,))
+            
+            row = cur.fetchone()
+            if not row:
+                return Response({"error": "No data found for this user"}, status=404)
+
+            colnames = [desc[0] for desc in cur.description]
+            org_data = dict(zip(colnames, row))
+
+        conn.close()
+        return Response(org_data, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching admin dashboard data: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['POST'])
+def get_admin_organization_data(request):
+    try:
+        # Decode JWT token
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        # Parse JSON request body
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        user_id = data.get('user_id')
+        organization_id = data.get('organization_id')
+
+        # Validate inputs
+        if not user_id:
+            return Response({"error": "User ID is required"}, status=400)
+
+        if not organization_id:
+            return Response({"error": "Organization ID is required"}, status=400)
+
+        # Connect to the database
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+    o.organization_name, 
+    o.organization_id, 
+    o.organization_status, 
+    o.address, 
+    o.website, 
+    o.status, 
+    o.organization_onboarded_at, 
+    o.license_type,
+    o.admin_email,
+    o.contact_number,
+    (
+        SELECT COUNT(*) 
+        FROM public.users u 
+        WHERE u.organization_id = o.organization_id
+    ) AS members_count,
+    (
+        SELECT COUNT(*) 
+        FROM public.users u 
+        WHERE u.organization_id = o.organization_id AND u.status = 'active'
+    ) AS active_user_count,
+    (
+        SELECT COUNT(*) 
+        FROM public.users u 
+        WHERE u.organization_id = o.organization_id AND u.status = 'Inactive'
+    ) AS inactive_user_count
+    FROM public.organizations o
+    WHERE o.organization_id = %s
+    AND EXISTS (
+    SELECT 1 
+    FROM public.users u 
+    WHERE u.organization_id = o.organization_id 
+      AND u.user_id = %s
+);
+            """, (organization_id, user_id))
+
+            row = cur.fetchone()
+            if not row:
+                return Response({"error": "No organization data found for this user"}, status=404)
+
+            # Map result to dictionary
+            colnames = [desc[0] for desc in cur.description]
+            org_data = dict(zip(colnames, row))
+
+        conn.close()
+        return Response(org_data, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching admin organization data: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+@api_view(['POST'])
+def add_users_to_group(request):
+    try:
+        # Decode JWT token
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        # Parse JSON request body
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        group_id = data.get('group_id')
+        selected_user_ids = data.get('selected_user_ids')
+
+        if not group_id:
+            return Response({"error": "Group ID is required"}, status=400)
+        if not selected_user_ids or not isinstance(selected_user_ids, list):
+            return Response({"error": "selected_user_ids must be a list of strings"}, status=400)
+
+        # Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # Update groups.user_ids (text[] column) with list of user IDs
+            cur.execute("""
+                UPDATE public.groups
+                SET user_ids = %s
+                WHERE group_id = %s
+                RETURNING group_id
+            """, (selected_user_ids, group_id))
+
+            row = cur.fetchone()
+            if not row:
+                return Response({"error": "No group data found for this user"}, status=404)
+
+            # Update each user's group_ids (text[] column)
+            for user_id in selected_user_ids:
+                cur.execute("""
+                    UPDATE public.users
+                    SET group_ids = CASE
+                        WHEN group_ids IS NULL THEN ARRAY[%s]::text[]
+                        WHEN %s = ANY(group_ids) THEN group_ids
+                        ELSE group_ids || ARRAY[%s]::text[]
+                    END
+                    WHERE user_id = %s
+                """, (str(group_id), str(group_id), str(group_id), int(user_id)))
+
+        conn.commit()
+        conn.close()
+
+        return Response({"message": "Users added to group successfully"}, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching admin organization data: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+
+@api_view(['POST'])
+def remove_user_from_group(request):
+    try:
+        # Decode JWT token
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        # Parse JSON request body
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        group_id = data.get('group_id')
+        user_id_to_remove = data.get('user_id')  # Should be a string
+
+        if not group_id:
+            return Response({"error": "Group ID is required"}, status=400)
+        if not user_id_to_remove or not isinstance(user_id_to_remove, str):
+            return Response({"error": "user_id must be a string"}, status=400)
+
+        # Connect to the database
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor() as cur:
+            # --- Step 1: Remove user_id from group's user_ids array ---
+            cur.execute("SELECT user_ids FROM public.groups WHERE group_id = %s", (group_id,))
+            row = cur.fetchone()
+            if not row:
+                return Response({"error": "No group found with the provided group_id"}, status=404)
+
+            current_user_ids = row[0] if row[0] else []
+
+            updated_user_ids = [uid for uid in current_user_ids if uid != user_id_to_remove]
+
+            cur.execute("""
+                UPDATE public.groups
+                SET user_ids = %s
+                WHERE group_id = %s
+                RETURNING group_id
+            """, (updated_user_ids, group_id))
+
+            if not cur.fetchone():
+                return Response({"error": "Failed to update the group"}, status=500)
+
+            # --- Step 2: Remove group_id from user's group_ids array ---
+            cur.execute("SELECT group_ids FROM public.users WHERE user_id = %s", (int(user_id_to_remove),))
+            user_row = cur.fetchone()
+            if not user_row:
+                return Response({"error": "No user found with the provided user_id"}, status=404)
+
+            current_group_ids = user_row[0] if user_row[0] else []
+
+            updated_group_ids = [gid for gid in current_group_ids if gid != str(group_id)]
+
+            cur.execute("""
+                UPDATE public.users
+                SET group_ids = %s
+                WHERE user_id = %s
+                RETURNING user_id
+            """, (updated_group_ids, int(user_id_to_remove)))
+
+            if not cur.fetchone():
+                return Response({"error": "Failed to update the user"}, status=500)
+
+        conn.commit()
+        conn.close()
+
+        return Response({
+            "message": f"User {user_id_to_remove} removed from group {group_id} successfully"
+        }, status=200)
+
+    except Exception as e:
+        logger.error(f"Error removing user from group: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
+
+
+@api_view(['POST'])
+def get_group_list_by_user(request):
+    try:
+        # Decode JWT token
+        payload = decode_jwt_token(request)
+        if payload is None:
+            return Response({"error": "Invalid token"}, status=401)
+        if payload == "expired":
+            return Response({"error": "Token expired"}, status=401)
+
+        # Parse JSON request body
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"status": 400, "message": "Invalid JSON payload"}, status=400)
+
+        user_id = data.get('user_id')
+        if not user_id:
+            return Response({"error": "User ID is required"}, status=400)
+
+        # Connect to DB
+        conn = get_db_connection()
+        if not conn:
+            return Response({"error": "Database connection failed"}, status=500)
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Query groups based on user's group_ids
+            cur.execute("""
+                SELECT 
+                    g.*, 
+                    cardinality(g.user_ids) AS user_count
+                FROM groups g
+                WHERE g.group_id = ANY (
+                    SELECT unnest(group_ids)::integer
+                    FROM users 
+                    WHERE user_id = %s
+                )
+            """, (user_id,))
+
+            rows = cur.fetchall()
+            if not rows:
+                return Response({"error": "No group data found for this user"}, status=404)
+
+        conn.close()
+
+        return Response({"groups": rows}, status=200)
+
+    except Exception as e:
+        logger.error(f"Error fetching user group list: {str(e)}")
+        return Response({"error": "Server error: " + str(e)}, status=500)
